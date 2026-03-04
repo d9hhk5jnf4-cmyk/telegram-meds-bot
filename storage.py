@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
+
 class Storage:
     def __init__(self, path: str = "bot.db"):
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -119,15 +120,12 @@ class Storage:
         """, (chat_id,)).fetchall()
         return {r["status"]: int(r["c"]) for r in rows}
 
-    # Rendering
+    # Rendering (новый стиль: коротко, без времени/дедлайнов)
     def render_task(self, task: Dict[str, Any]) -> str:
-        def hhmm(s: str) -> str:
-            return s[11:16]
-        status = task["status"]
-        status_emoji = "⏳" if status == "pending" else ("✅" if status == "done" else "❌")
-        return (
-            f"{status_emoji} 🕒 {hhmm(task['scheduled_for'])} (Мск)\n"
-            f"*{task['title']}*\n\n"
-            f"{task['details']}\n\n"
-            f"Дедлайн: {hhmm(task['deadline_at'])}"
-        )
+        if not task:
+            return "Задача не найдена"
+        title = (task.get("title") or "").strip()
+        details = (task.get("details") or "").strip()
+        if details:
+            return f"{title}\n{details}".strip()
+        return title
