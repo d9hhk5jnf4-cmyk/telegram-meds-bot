@@ -11,8 +11,10 @@ from plan import TZ, SLOTS, build_tasks_for_slot, followups_for_base
 TOKEN = os.getenv("BOT_TOKEN")
 storage = Storage("bot.db")
 
+
 def now_msk() -> datetime:
     return datetime.now(TZ)
+
 
 def kb(task_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -23,6 +25,7 @@ def kb(task_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❌ Пропустить", callback_data=f"skip:{task_id}")]
     ])
 
+
 async def send_task(context: ContextTypes.DEFAULT_TYPE, task_id: int):
     task = storage.get_task(task_id)
     if not task:
@@ -30,14 +33,15 @@ async def send_task(context: ContextTypes.DEFAULT_TYPE, task_id: int):
     await context.bot.send_message(
         chat_id=task["chat_id"],
         text=storage.render_task(task),
-        parse_mode="Markdown",
         reply_markup=kb(task_id)
     )
+
 
 async def trigger_slot(app: Application, slot: str):
     for chat_id in storage.get_users():
         if storage.is_paused(chat_id):
             continue
+
         for spec in build_tasks_for_slot(slot):
             task_id = storage.create_task(
                 chat_id=chat_id,
@@ -49,21 +53,22 @@ async def trigger_slot(app: Application, slot: str):
                 scheduled_for=spec.scheduled_for,
                 deadline_at=spec.deadline_at
             )
-            # отправляем сразу, когда наступил слот
-            # (для таблеток 08:30: она создаётся на 07:30 слоте, но отправлять нужно в 08:30 — сделаем отдельной job)
+
+            # Таблетки (08:30) создаём на 07:30, но отправляем в своё время
             if spec.kind == "pill" and spec.scheduled_for > now_msk():
+                delay = (spec.scheduled_for - now_msk()).total_seconds()
                 app.job_queue.run_once(
                     lambda c, tid=task_id: send_task(c, tid),
-                    when=(spec.scheduled_for - now_msk()).total_seconds(),
+                    when=delay,
                     name=f"task:{task_id}"
                 )
             else:
                 await app.bot.send_message(
                     chat_id=chat_id,
                     text=storage.render_task(storage.get_task(task_id)),
-                    parse_mode="Markdown",
                     reply_markup=kb(task_id)
                 )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -74,8 +79,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today — план и статус на сегодня\n"
         "/stats — статистика\n"
         "/pause — пауза\n"
-        "/resume — продолжить\n"
+        "/resume — продолжить"
     )
+
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -84,29 +90,36 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text("На сегодня пока нет задач (они появятся по расписанию).")
         return
+
     lines = []
     for t in items:
         status = "⏳" if t["status"] == "pending" else ("✅" if t["status"] == "done" else "❌")
-        lines.append(f"{status} {t['scheduled_for'][11:16]} — {t['title']}")
+        # показываем кратко: статус + заголовок
+        lines.append(f"{status} {t['title']}")
+
     await update.message.reply_text("Сегодня:\n" + "\n".join(lines))
+
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     s = storage.stats(chat_id)
     await update.message.reply_text(
         "Статистика:\n"
-        f"✅ выполнено: {s.get('done',0)}\n"
-        f"⏳ ожидает: {s.get('pending',0)}\n"
-        f"❌ пропущено: {s.get('skipped',0)}"
+        f"✅ выполнено: {s.get('done', 0)}\n"
+        f"⏳ ожидает: {s.get('pending', 0)}\n"
+        f"❌ пропущено: {s.get('skipped', 0)}"
     )
+
 
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage.set_paused(update.effective_chat.id, True)
     await update.message.reply_text("Ок, пауза. /resume чтобы включить снова.")
 
+
 async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage.set_paused(update.effective_chat.id, False)
     await update.message.reply_text("Вернула напоминания ✅")
+
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -124,12 +137,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage.mark_done(task_id, now_msk())
         task = storage.get_task(task_id)
 
-        # Запускаем цепочки от факта выполнения
+        # Цепочки от факта выполнения (капли -> +5/+10)
         if task and task["kind"] == "base" and int(task["chain"]) == 1:
             done_at = datetime.fromisoformat(task["done_at"])
             for fu in followups_for_base(task["slot"]):
                 scheduled_for = done_at + timedelta(minutes=fu["offset_min"])
                 deadline_at = done_at + timedelta(minutes=fu["deadline_min"])
+
                 fu_id = storage.create_task(
                     chat_id=chat_id,
                     title=fu["title"],
@@ -141,30 +155,37 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     deadline_at=deadline_at,
                     parent_task_id=task_id
                 )
+
+                delay = (scheduled_for - now_msk()).total_seconds()
+                if delay < 0:
+                    delay = 0
                 context.job_queue.run_once(
                     lambda c, tid=fu_id: send_task(c, tid),
-                    when=(scheduled_for - now_msk()).total_seconds(),
+                    when=delay,
                     name=f"task:{fu_id}"
                 )
 
-        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n✅ Отмечено как выполнено.", parse_mode="Markdown")
+        # лаконичная отметка
+        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n✅ Отмечено")
 
     elif action == "skip":
         storage.mark_skipped(task_id, now_msk())
-        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n❌ Пропущено.", parse_mode="Markdown")
+        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n❌ Пропущено")
 
     elif action == "snooze10":
         new_time = now_msk() + timedelta(minutes=10)
         storage.snooze(task_id, new_time)
+
         context.job_queue.run_once(
             lambda c, tid=task_id: send_task(c, tid),
             when=10 * 60,
             name=f"task:{task_id}"
         )
-        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n⏰ Отложено на 10 минут.", parse_mode="Markdown")
+
+        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n⏰ Отложено на 10 минут")
+
 
 def schedule_slots(app: Application):
-    # ежедневные слоты по Мск
     for slot in SLOTS:
         hh, mm = map(int, slot.split(":"))
         app.job_queue.run_daily(
@@ -173,11 +194,13 @@ def schedule_slots(app: Application):
             name=f"slot:{slot}",
         )
 
+
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
 
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("stats", stats))
@@ -187,6 +210,7 @@ def main():
 
     schedule_slots(app)
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
