@@ -1,330 +1,547 @@
+import logging
 import os
-from datetime import datetime, timedelta, time as dtime
+import random
+import sqlite3
+from dataclasses import dataclass
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import BotCommand, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from storage import Storage
-from plan import TZ, SLOTS, build_tasks_for_slot, followups_for_base
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN")
-storage = Storage("bot.db")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+TREATMENT_START = os.getenv("TREATMENT_START", "2026-04-10")
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN")
+
+TZ = ZoneInfo(TIMEZONE)
+START_DATE = date.fromisoformat(TREATMENT_START)
 
 
-def now_msk() -> datetime:
+@dataclass(frozen=True)
+class PlanItem:
+    key: str
+    hh: int
+    mm: int
+    title: str
+    details: str
+    duration_days: int | None = None
+    is_quote: bool = False
+
+    @property
+    def at(self) -> time:
+        return time(self.hh, self.mm, tzinfo=TZ)
+
+    @property
+    def time_str(self) -> str:
+        return f"{self.hh:02d}:{self.mm:02d}"
+
+
+PLAN: list[PlanItem] = [
+    PlanItem(
+        key="thermometry_08_00",
+        hh=8,
+        mm=0,
+        title="Термометрия",
+        details=(
+            "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
+            "или Ибупрофен 200 мг."
+        ),
+        duration_days=None,
+    ),
+    PlanItem(
+        key="nose_rinse_1",
+        hh=8,
+        mm=10,
+        title="Промывание носа",
+        details="Аквалор / Аквамарис.",
+        duration_days=7,
+    ),
+    PlanItem(
+        key="nose_spray_1",
+        hh=8,
+        mm=15,
+        title="Спрей для носа",
+        details="Синусэфрин / Полидекса.",
+        duration_days=7,
+    ),
+    PlanItem(
+        key="vitamin_c",
+        hh=8,
+        mm=30,
+        title="Витамин C",
+        details="Витамин C 1000 мг/день. Лучше после еды.",
+        duration_days=10,
+    ),
+    PlanItem(
+        key="vitamin_d3",
+        hh=8,
+        mm=35,
+        title="Витамин D3",
+        details="Витамин D3 (Аквадетрим) 2000 Ед/день. Лучше после еды.",
+        duration_days=30,
+    ),
+    PlanItem(
+        key="inhalation_1",
+        hh=9,
+        mm=0,
+        title="Ингаляция (небулайзер)",
+        details=(
+            "Пульмикорт 0.5: 1 фл + Беродуал 20 капель + 5 мл физраствора. "
+            "После ингаляции промыть рот водой."
+        ),
+        duration_days=6,
+    ),
+    PlanItem(
+        key="acc",
+        hh=10,
+        mm=0,
+        title="АЦЦ-Лонг / Флуимуцил / Флуифорт",
+        details="600 мг, 1 раз в день, в первой половине дня.",
+        duration_days=5,
+    ),
+    PlanItem(
+        key="thermometry_12_00",
+        hh=12,
+        mm=0,
+        title="Термометрия",
+        details=(
+            "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
+            "или Ибупрофен 200 мг."
+        ),
+        duration_days=None,
+    ),
+    PlanItem(
+        key="nose_rinse_2",
+        hh=12,
+        mm=30,
+        title="Промывание носа",
+        details="Аквалор / Аквамарис.",
+        duration_days=7,
+    ),
+    PlanItem(
+        key="nose_spray_2",
+        hh=12,
+        mm=35,
+        title="Спрей для носа",
+        details="Синусэфрин / Полидекса.",
+        duration_days=7,
+    ),
+    PlanItem(
+        key="gargle_lunch",
+        hh=13,
+        mm=30,
+        title="Полоскание",
+        details=(
+            "Фурацилин: 1 таб + 100 мл воды. "
+            "ОКИ: 10 мл раствора + 100 мл воды."
+        ),
+        duration_days=5,
+    ),
+    PlanItem(
+        key="azithromycin",
+        hh=14,
+        mm=0,
+        title="Азитромицин (Сумамед)",
+        details="500 мг, 1 таблетка 1 раз в сутки.",
+        duration_days=6,
+    ),
+    PlanItem(
+        key="thermometry_16_00",
+        hh=16,
+        mm=0,
+        title="Термометрия",
+        details=(
+            "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
+            "или Ибупрофен 200 мг."
+        ),
+        duration_days=None,
+    ),
+    PlanItem(
+        key="probiotic",
+        hh=17,
+        mm=0,
+        title="Пробиотик",
+        details=(
+            "Линекс / Аципол / Бифиформ / Максилак / Пробиолог, "
+            "по 1 капсуле 1 раз в день, через 3 часа после антибиотика."
+        ),
+        duration_days=10,
+    ),
+    PlanItem(
+        key="gargle_evening_1",
+        hh=17,
+        mm=30,
+        title="Полоскание",
+        details=(
+            "Фурацилин: 1 таб + 100 мл воды. "
+            "ОКИ: 10 мл раствора + 100 мл воды."
+        ),
+        duration_days=5,
+    ),
+    PlanItem(
+        key="nose_rinse_3",
+        hh=18,
+        mm=30,
+        title="Промывание носа",
+        details="Аквалор / Аквамарис.",
+        duration_days=7,
+    ),
+    PlanItem(
+        key="nose_spray_3",
+        hh=18,
+        mm=35,
+        title="Спрей для носа",
+        details="Синусэфрин / Полидекса.",
+        duration_days=7,
+    ),
+    PlanItem(
+        key="inhalation_2",
+        hh=20,
+        mm=0,
+        title="Ингаляция (небулайзер)",
+        details=(
+            "Пульмикорт 0.5: 1 фл + Беродуал 20 капель + 5 мл физраствора. "
+            "После ингаляции промыть рот водой."
+        ),
+        duration_days=6,
+    ),
+    PlanItem(
+        key="thermometry_20_00",
+        hh=20,
+        mm=5,
+        title="Термометрия",
+        details=(
+            "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
+            "или Ибупрофен 200 мг."
+        ),
+        duration_days=None,
+    ),
+    PlanItem(
+        key="gargle_evening_2",
+        hh=21,
+        mm=0,
+        title="Полоскание",
+        details=(
+            "Фурацилин: 1 таб + 100 мл воды. "
+            "ОКИ: 10 мл раствора + 100 мл воды."
+        ),
+        duration_days=5,
+    ),
+    PlanItem(
+        key="quote",
+        hh=21,
+        mm=30,
+        title="Вечерняя поддержка",
+        details="Поддерживающая цитата.",
+        duration_days=None,
+        is_quote=True,
+    ),
+]
+
+QUOTES = [
+    "Успех — это сумма маленьких усилий, повторяемых изо дня в день. — Роберт Колльер",
+    "Сила не в том, чтобы никогда не падать, а в том, чтобы подниматься каждый раз. — Конфуций",
+    "Терпение, настойчивость и труд создают непобедимое сочетание. — Наполеон Хилл",
+    "Сделанное сегодня меняет завтра. — Джеймс Клир",
+    "Мужество — это идти вперёд, даже когда трудно. — Теодор Рузвельт",
+    "Великие дела состоят из маленьких дел, доведённых до конца. — Винсент Ван Гог",
+]
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def add_subscriber(chat_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO subscribers (chat_id, created_at)
+            VALUES (?, ?)
+            """,
+            (chat_id, datetime.now(TZ).isoformat()),
+        )
+        conn.commit()
+
+
+def remove_subscriber(chat_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+
+
+def get_subscribers() -> list[int]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT chat_id FROM subscribers").fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
+def now_local() -> datetime:
     return datetime.now(TZ)
 
 
-def kb(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Сделано", callback_data=f"done:{task_id}"),
-            InlineKeyboardButton("⏰ +10 минут", callback_data=f"snooze10:{task_id}")
-        ],
-        [InlineKeyboardButton("❌ Пропустить", callback_data=f"skip:{task_id}")]
-    ])
+def treatment_day(target_date: date | None = None) -> int:
+    current = target_date or now_local().date()
+    return (current - START_DATE).days + 1
 
 
-async def send_task(context: ContextTypes.DEFAULT_TYPE, task_id: int):
-    task = storage.get_task(task_id)
-    if not task:
+def is_item_active(item: PlanItem, target_date: date | None = None) -> bool:
+    current = target_date or now_local().date()
+
+    if current < START_DATE:
+        return False
+
+    if item.is_quote:
+        return True
+
+    if item.duration_days is None:
+        return True
+
+    day_number = treatment_day(current)
+    return 1 <= day_number <= item.duration_days
+
+
+def get_active_items_for_date(target_date: date | None = None) -> list[PlanItem]:
+    current = target_date or now_local().date()
+    items = [item for item in PLAN if is_item_active(item, current) and not item.is_quote]
+    return sorted(items, key=lambda x: (x.hh, x.mm, x.key))
+
+
+def get_next_active_item(now_dt: datetime | None = None) -> PlanItem | None:
+    now_dt = now_dt or now_local()
+    active_items = get_active_items_for_date(now_dt.date())
+    current_minutes = now_dt.hour * 60 + now_dt.minute
+
+    for item in active_items:
+        item_minutes = item.hh * 60 + item.mm
+        if item_minutes >= current_minutes:
+            return item
+    return None
+
+
+def get_following_active_item(item_key: str, target_date: date | None = None) -> PlanItem | None:
+    active_items = get_active_items_for_date(target_date)
+    for idx, item in enumerate(active_items):
+        if item.key == item_key and idx + 1 < len(active_items):
+            return active_items[idx + 1]
+    return None
+
+
+def format_plan_for_today() -> str:
+    today = now_local().date()
+
+    if today < START_DATE:
+        return f"Лечение ещё не началось. Старт: {START_DATE.isoformat()}"
+
+    active_items = get_active_items_for_date(today)
+    day_num = treatment_day(today)
+
+    if not active_items:
+        return "На сегодня активных назначений по плану уже нет."
+
+    lines = [f"🩺 План на сегодня (день {day_num}):"]
+    for item in active_items:
+        lines.append(f"{item.time_str} — {item.title}")
+        lines.append(f"    {item.details}")
+    return "\n".join(lines)
+
+
+def format_next() -> str:
+    now_dt = now_local()
+    today = now_dt.date()
+
+    if today < START_DATE:
+        return f"Лечение ещё не началось. Старт: {START_DATE.isoformat()}"
+
+    next_item = get_next_active_item(now_dt)
+    if next_item is None:
+        return "На сегодня больше нет активных пунктов плана."
+
+    following = get_following_active_item(next_item.key, today)
+    lines = [
+        f"⏭ Следующее по плану: {next_item.time_str} — {next_item.title}",
+        next_item.details,
+    ]
+    if following:
+        lines.append(f"\nПотом: {following.time_str} — {following.title}")
+    return "\n".join(lines)
+
+
+async def send_to_all_subscribers(application: Application, text: str) -> None:
+    subscribers = get_subscribers()
+    if not subscribers:
         return
-    await context.bot.send_message(
-        chat_id=task["chat_id"],
-        text=storage.render_task(task),
-        reply_markup=kb(task_id)
+
+    for chat_id in subscribers:
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as exc:
+            logger.warning("Не удалось отправить сообщение chat_id=%s: %s", chat_id, exc)
+
+
+async def reminder_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    item_key = context.job.data["item_key"]
+    item = next((i for i in PLAN if i.key == item_key), None)
+    if item is None:
+        return
+
+    today = now_local().date()
+    if not is_item_active(item, today):
+        return
+
+    following = get_following_active_item(item.key, today)
+    lines = [
+        f"⏰ {item.time_str} — {item.title}",
+        item.details,
+    ]
+    if following:
+        lines.append(f"\nДальше по плану: {following.time_str} — {following.title}")
+
+    await send_to_all_subscribers(context.application, "\n".join(lines))
+
+
+async def evening_quote_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = now_local().date()
+    if today < START_DATE:
+        return
+
+    text = (
+        "🌟 Ты молодец. Сегодня ты справилась со всем, что было нужно, "
+        "и делаешь ещё один шаг к восстановлению.\n\n"
+        f"«{random.choice(QUOTES)}»"
     )
+    await send_to_all_subscribers(context.application, text)
 
 
-async def trigger_slot(app: Application, slot: str):
-    """Создаёт задачи на слот и отправляет их пользователям."""
-    for chat_id in storage.get_users():
-        if storage.is_paused(chat_id):
-            continue
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
 
-        for spec in build_tasks_for_slot(slot):
-            task_id = storage.create_task(
-                chat_id=chat_id,
-                title=spec.title,
-                details=spec.details,
-                slot=spec.slot,
-                kind=spec.kind,
-                chain=spec.chain,
-                scheduled_for=spec.scheduled_for,
-                deadline_at=spec.deadline_at
-            )
+    add_subscriber(update.effective_chat.id)
 
-            # Таблетки (например 08:30) создаём на 07:30, но отправляем в своё время
-            if spec.kind == "pill" and spec.scheduled_for > now_msk():
-                delay = (spec.scheduled_for - now_msk()).total_seconds()
-                app.job_queue.run_once(
-                    one_off_send_task,
-                    when=delay,
-                    chat_id=chat_id,
-                    data={"task_id": task_id},
-                    name=f"task:{task_id}",
-                )
-            else:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=storage.render_task(storage.get_task(task_id)),
-                    reply_markup=kb(task_id)
-                )
-
-
-# ---------------- JOB HANDLERS (без lambda — стабильнее) ----------------
-
-async def slot_job(context: ContextTypes.DEFAULT_TYPE):
-    slot = context.job.data["slot"]
-    await trigger_slot(context.application, slot)
-
-
-async def one_off_send_task(context: ContextTypes.DEFAULT_TYPE):
-    task_id = context.job.data["task_id"]
-    await send_task(context, task_id)
-
-
-# ---------------- COMMANDS ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    storage.upsert_user(chat_id)
-    await update.message.reply_text(
-        "Я включён ✅\n"
+    text = (
+        "Привет! Я бот-напоминалка по твоему плану лечения 💛\n\n"
+        f"Старт лечения: {START_DATE.isoformat()}\n\n"
         "Команды:\n"
-        "/next — следующий приём\n"
-        "/plan — план на сегодня\n"
-        "/today — что уже создано/отмечено сегодня\n"
-        "/stats — статистика\n"
-        "/pause — пауза\n"
-        "/resume — продолжить\n"
-        "/ping — проверка"
+        "/today — показать актуальный план на сегодня\n"
+        "/next — показать ближайший следующий пункт\n"
+        "/quote — прислать вечернюю цитату сейчас\n"
+        "/stop — отключить напоминания"
     )
+    await update.message.reply_text(text)
+    await update.message.reply_text(format_plan_for_today())
 
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я жив ✅")
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(format_plan_for_today())
 
 
-def _format_in(diff: timedelta) -> str:
-    total_seconds = int(diff.total_seconds())
-    if total_seconds < 0:
-        total_seconds = 0
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    if hours > 0:
-        return f"{hours}ч {minutes}м"
-    return f"{minutes}м"
+async def next_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(format_next())
 
 
-def _next_slot_dt(now: datetime):
-    upcoming = []
-    for slot in SLOTS:
-        hh, mm = map(int, slot.split(":"))
-        dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if dt <= now:
-            dt = dt + timedelta(days=1)
-        upcoming.append((dt, slot))
-    return min(upcoming, key=lambda x: x[0])  # (datetime, "HH:MM")
-
-
-async def next_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = now_msk()
-    next_time, slot = _next_slot_dt(now)
-    diff = next_time - now
-
-    # Показываем "что будет" по расписанию (первую задачу слота; таблетки не дублируем тут отдельно)
-    specs = build_tasks_for_slot(slot)
-    if specs:
-        preview = f"{specs[0].title}\n{specs[0].details}".strip()
-    else:
-        preview = "Следующий приём по расписанию."
-
-    await update.message.reply_text(
-        f"Следующий приём\n\n{preview}\n\nчерез {_format_in(diff)}"
-    )
-
-
-async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Показывает план оставшихся слотов на сегодня (по расписанию),
-    без привязки к тому, созданы ли уже задачи в БД.
-    """
-    now = now_msk()
-    today = now.date()
-    lines = []
-
-    # оставшиеся слоты сегодня
-    for slot in SLOTS:
-        hh, mm = map(int, slot.split(":"))
-        dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if dt.date() != today:
-            continue
-        if dt <= now:
-            continue
-
-        specs = build_tasks_for_slot(slot)
-        if specs:
-            # обычно первый spec — глазной базовый шаг (то, что нужно видеть)
-            lines.append(f"• {specs[0].title}")
-
-    # таблеточный блок (если он у тебя отдельным временем — показываем один раз, если ещё впереди)
-    # Он создаётся внутри build_tasks_for_slot("07:30"), но для плана покажем отдельно:
-    # Берём его из build_tasks_for_slot("07:30") и проверяем время относительно now.
-    pill_specs = [s for s in build_tasks_for_slot("07:30") if s.kind == "pill"]
-    if pill_specs:
-        ps = pill_specs[0]
-        if ps.scheduled_for.date() == today and ps.scheduled_for > now:
-            lines.insert(0, f"• {ps.title}")
-
-    if not lines:
-        await update.message.reply_text("На сегодня по расписанию больше ничего нет. Ждём следующий приём завтра ✅")
-        return
-
-    await update.message.reply_text("План на сегодня (оставшиеся приёмы):\n" + "\n".join(lines))
-
-
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Показывает то, что уже было СОЗДАНО сегодня (и статус).
-    Полезно для трекера, но помни: задачи появляются только когда наступает слот.
-    """
-    chat_id = update.effective_chat.id
-    day_iso = now_msk().date().isoformat()
-    items = storage.list_day(chat_id, day_iso)
-    if not items:
-        await update.message.reply_text("На сегодня пока нет созданных задач (они появятся по расписанию).")
-        return
-
-    lines = []
-    for t in items:
-        status = "⏳" if t["status"] == "pending" else ("✅" if t["status"] == "done" else "❌")
-        lines.append(f"{status} {t['title']}")
-
-    await update.message.reply_text("Сегодня (созданные задачи):\n" + "\n".join(lines))
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    s = storage.stats(chat_id)
-    await update.message.reply_text(
-        "Статистика:\n"
-        f"✅ выполнено: {s.get('done', 0)}\n"
-        f"⏳ ожидает: {s.get('pending', 0)}\n"
-        f"❌ пропущено: {s.get('skipped', 0)}"
-    )
-
-
-async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage.set_paused(update.effective_chat.id, True)
-    await update.message.reply_text("Ок, пауза. /resume чтобы включить снова.")
-
-
-async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage.set_paused(update.effective_chat.id, False)
-    await update.message.reply_text("Вернула напоминания ✅")
-
-
-# ---------------- BUTTONS ----------------
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat.id
-
-    action, task_id_s = q.data.split(":")
-    task_id = int(task_id_s)
-
-    if storage.is_paused(chat_id):
-        await q.edit_message_text("Сейчас пауза. /resume чтобы включить.")
-        return
-
-    if action == "done":
-        storage.mark_done(task_id, now_msk())
-        task = storage.get_task(task_id)
-
-        # Цепочки от факта выполнения (капли -> +5/+10)
-        if task and task["kind"] == "base" and int(task["chain"]) == 1:
-            done_at = datetime.fromisoformat(task["done_at"])
-            for fu in followups_for_base(task["slot"]):
-                scheduled_for = done_at + timedelta(minutes=fu["offset_min"])
-                deadline_at = done_at + timedelta(minutes=fu["deadline_min"])
-
-                fu_id = storage.create_task(
-                    chat_id=chat_id,
-                    title=fu["title"],
-                    details=fu["details"],
-                    slot=task["slot"],
-                    kind="followup",
-                    chain=False,
-                    scheduled_for=scheduled_for,
-                    deadline_at=deadline_at,
-                    parent_task_id=task_id
-                )
-
-                delay = (scheduled_for - now_msk()).total_seconds()
-                if delay < 0:
-                    delay = 0
-
-                context.job_queue.run_once(
-                    one_off_send_task,
-                    when=delay,
-                    chat_id=chat_id,
-                    data={"task_id": fu_id},
-                    name=f"task:{fu_id}",
-                )
-
-        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n✅ Отмечено")
-
-    elif action == "skip":
-        storage.mark_skipped(task_id, now_msk())
-        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n❌ Пропущено")
-
-    elif action == "snooze10":
-        new_time = now_msk() + timedelta(minutes=10)
-        storage.snooze(task_id, new_time)
-
-        context.job_queue.run_once(
-            one_off_send_task,
-            when=10 * 60,
-            chat_id=chat_id,
-            data={"task_id": task_id},
-            name=f"task:{task_id}"
-        )
-
-        await q.edit_message_text(storage.render_task(storage.get_task(task_id)) + "\n\n⏰ Отложено на 10 минут")
-
-
-# ---------------- SCHEDULER ----------------
-
-def schedule_slots(app: Application):
-    for slot in SLOTS:
-        hh, mm = map(int, slot.split(":"))
-        app.job_queue.run_daily(
-            slot_job,
-            time=dtime(hour=hh, minute=mm, tzinfo=TZ),
-            data={"slot": slot},
-            name=f"slot:{slot}",
+async def quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "🌟 Ты молодец. Ты лечишься, выдерживаешь режим и становишься здоровее.\n\n"
+            f"«{random.choice(QUOTES)}»"
         )
 
 
-def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
 
-    app = Application.builder().token(TOKEN).build()
+    remove_subscriber(update.effective_chat.id)
+    await update.message.reply_text(
+        "Ок, напоминания отключены. Чтобы включить снова, нажми /start"
+    )
+
+
+async def set_bot_commands(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "включить напоминания"),
+            BotCommand("today", "актуальный план на сегодня"),
+            BotCommand("next", "что дальше по плану"),
+            BotCommand("quote", "получить поддержку"),
+            BotCommand("stop", "выключить напоминания"),
+        ]
+    )
+
+
+def schedule_jobs(application: Application) -> None:
+    jq = application.job_queue
+
+    for item in PLAN:
+        if item.is_quote:
+            continue
+
+        jq.run_daily(
+            callback=reminder_callback,
+            time=item.at,
+            data={"item_key": item.key},
+            name=f"reminder_{item.key}",
+        )
+
+    jq.run_daily(
+        callback=evening_quote_callback,
+        time=time(21, 30, tzinfo=TZ),
+        name="evening_quote",
+    )
+
+
+async def post_init(app: Application) -> None:
+    await set_bot_commands(app)
+    schedule_jobs(app)
+    logger.info("Бот инициализирован")
+
+
+def main() -> None:
+    init_db()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .timezone(TZ)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("next", next_slot))
-    app.add_handler(CommandHandler("plan", plan))
     app.add_handler(CommandHandler("today", today))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("pause", pause))
-    app.add_handler(CommandHandler("resume", resume))
-    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(CommandHandler("next", next_step))
+    app.add_handler(CommandHandler("quote", quote))
+    app.add_handler(CommandHandler("stop", stop))
 
-    schedule_slots(app)
+    logger.info("Запуск бота")
     app.run_polling(close_loop=False)
 
 
