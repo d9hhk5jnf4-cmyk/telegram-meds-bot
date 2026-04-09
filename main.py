@@ -7,7 +7,7 @@ from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, Defaults
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -56,7 +56,6 @@ PLAN: list[PlanItem] = [
             "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
             "или Ибупрофен 200 мг."
         ),
-        duration_days=None,
     ),
     PlanItem(
         key="nose_rinse_1",
@@ -118,7 +117,6 @@ PLAN: list[PlanItem] = [
             "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
             "или Ибупрофен 200 мг."
         ),
-        duration_days=None,
     ),
     PlanItem(
         key="nose_rinse_2",
@@ -164,7 +162,6 @@ PLAN: list[PlanItem] = [
             "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
             "или Ибупрофен 200 мг."
         ),
-        duration_days=None,
     ),
     PlanItem(
         key="probiotic",
@@ -224,7 +221,6 @@ PLAN: list[PlanItem] = [
             "Измерить температуру. При t > 37,0°C: Парацетамол 500 мг "
             "или Ибупрофен 200 мг."
         ),
-        duration_days=None,
     ),
     PlanItem(
         key="gargle_evening_2",
@@ -243,7 +239,6 @@ PLAN: list[PlanItem] = [
         mm=30,
         title="Вечерняя поддержка",
         details="Поддерживающая цитата.",
-        duration_days=None,
         is_quote=True,
     ),
 ]
@@ -527,10 +522,12 @@ async def post_init(app: Application) -> None:
 def main() -> None:
     init_db()
 
+    defaults = Defaults(tzinfo=TZ)
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .timezone(TZ)
+        .defaults(defaults)
         .post_init(post_init)
         .build()
     )
@@ -542,7 +539,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", stop))
 
     logger.info("Запуск бота")
-    app.run_polling(close_loop=False)
+    app.run_polling()
 
 
 if __name__ == "__main__":
